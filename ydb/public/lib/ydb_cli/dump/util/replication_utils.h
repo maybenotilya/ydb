@@ -8,6 +8,10 @@ namespace NYdb::inline Dev::NReplication {
     class TTransferDescription;
 } // namespace NYdb::NReplication
 
+namespace NYql {
+    class TIssues;
+}
+
 namespace NYdb::NDump {
 
 TString BuildCreateReplicationQuery(
@@ -23,5 +27,11 @@ TString BuildCreateTransferQuery(
     const TString& backupRoot,
     const TString& name,
     const NReplication::TTransferDescription& desc);
+
+bool RewriteCreateAsyncReplicationQuery(
+        TString& query,
+        const TString& dbRestoreRoot,
+        const TString& dbPath,
+        NYql::TIssues& issues);
 
 } // namespace NYdb::NDump

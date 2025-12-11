@@ -1,6 +1,9 @@
 #include "replication_utils.h"
+#include "query_utils.h"
 
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/draft/ydb_replication.h>
+
+#include <yql/essentials/public/issue/yql_issue.h>
 
 #include <util/string/builder.h>
 #include <util/string/join.h>
@@ -167,6 +170,44 @@ TString BuildCreateTransferQuery(
             desc.GetSrcPath().c_str(), desc.GetDstPath().c_str(), lambdaName.c_str(),
             JoinSeq(",\n", options).c_str()
         );
+}
+
+namespace {
+
+bool IsSchemaSecret(TStringBuf secretName) {
+    return secretName.StartsWith('/');
+}
+
+bool RewriteSecretsNoCheck(TString& query, const TString& dbRestoreRoot, NYql::TIssues& issues) {
+    auto secretSettings = GetSecretSettings(query);
+    for (auto& secretSetting : secretSettings) {
+        if (IsSchemaSecret(secretSetting.Value)) {
+            secretSetting.Value = RewriteAbsolutePath(secretSetting.Value, GetDatabase(query), dbRestoreRoot);
+        }
+
+        if (!RewriteCreateQuery(query, secretSetting.Name + " = '{}'", secretSetting.Value, issues)) {
+           return false;
+        }
+    }
+
+    return true;
+}
+
+} // anonymous namespace
+
+bool RewriteCreateAsyncReplicationQuery(
+    TString& query,
+    const TString& dbRestoreRoot,
+    const TString& dbPath,
+    NYql::TIssues& issues) {
+    
+    if (!RewriteSecretsNoCheck(query, dbRestoreRoot, issues)) {
+        return false;
+    }
+    if (!RewriteObjectRefs(query, dbRestoreRoot, issues)) {
+        return false;
+    }
+    return RewriteCreateQuery(query, "CREATE ASYNC REPLICATION `{}`", dbPath, issues);
 }
 
 } // namespace NYdb::NDump
