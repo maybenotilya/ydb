@@ -1604,10 +1604,7 @@ TRestoreResult TRestoreClient::RestoreReplication(
     }
 
     NYql::TIssues issues;
-    if (!RewriteObjectRefs(query, dbRestoreRoot, issues)) {
-        return Result<TRestoreResult>(fsPath.GetPath(), EStatus::BAD_REQUEST, issues.ToString());
-    }
-    if (!RewriteCreateQuery(query, "CREATE ASYNC REPLICATION `{}`", dbPath, issues)) {
+    if (!RewriteCreateAsyncReplicationQueryNoSecrets(query, dbRestoreRoot, dbPath, issues)) {
         return Result<TRestoreResult>(fsPath.GetPath(), EStatus::BAD_REQUEST, issues.ToString());
     }
 
