@@ -20,8 +20,11 @@
 #include <ydb/public/lib/ydb_cli/common/retry_func.h>
 #include <ydb/public/lib/ydb_cli/dump/files/files.h>
 #include <ydb/public/lib/ydb_cli/dump/util/util.h>
+#include <ydb/public/lib/ydb_cli/dump/util/external_data_source_utils.h>
+#include <ydb/public/lib/ydb_cli/dump/util/external_table_utils.h>
 #include <ydb/public/lib/ydb_cli/dump/util/replication_utils.h>
 #include <ydb/public/lib/ydb_cli/dump/util/view_utils.h>
+#include <ydb/public/lib/ydb_cli/dump/util/query_utils.h>
 #include <ydb/public/lib/yson_value/ydb_yson_value.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/draft/ydb_view.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/proto/accessor.h>
@@ -55,9 +58,6 @@
 #include <util/system/fs.h>
 
 #include <google/protobuf/text_format.h>
-
-#include <format>
-#include <ranges>
 
 namespace NYdb::NBackup {
 
@@ -777,45 +777,13 @@ void BackupTransfer(
     const auto creationTransferQuery = NDump::BuildCreateTransferQuery(db, dbBackupRoot, fsBackupFolder.GetName(), *desc);
 
     WriteCreationQueryToFile(creationTransferQuery, fsBackupFolder, NDump::NFiles::CreateTransfer());
-    BackupPermissions(driver, dbPath, fsBackupFolder);    
+    BackupPermissions(driver, dbPath, fsBackupFolder);
 }
 
 namespace {
 
-std::string ToString(std::string_view key, std::string_view value) {
-    // indented to follow the default YQL formatting
-    return std::format(R"(  {} = '{}')", key, value);
-}
-
-namespace NExternalDataSource {
-
-    std::string PropertyToString(const std::pair<TProtoStringType, TProtoStringType>& property) {
-        const auto& [key, value] = property;
-        return ToString(key, value);
-    }
-
-}
-
 void CanonizeForBackup(Ydb::Table::DescribeExternalDataSourceResult& desc) {
     desc.mutable_properties()->erase("REFERENCES");
-}
-
-TString BuildCreateExternalDataSourceQuery(
-    const Ydb::Table::DescribeExternalDataSourceResult& description,
-    const TString& db)
-{
-    return std::format(
-        "-- database: \"{}\"\n"
-        "CREATE EXTERNAL DATA SOURCE IF NOT EXISTS `{}` WITH (\n{},\n{}{}\n);",
-        db.c_str(),
-        description.self().name().c_str(),
-        ToString("SOURCE_TYPE", description.source_type()),
-        ToString("LOCATION", description.location()),
-        description.properties().empty()
-            ? ""
-            : std::string(",\n") +
-                JoinSeq(",\n", std::views::transform(description.properties(), NExternalDataSource::PropertyToString)).c_str()
-    );
 }
 
 }
@@ -828,7 +796,7 @@ void BackupExternalDataSource(TDriver driver, const TString& db, const TString& 
     NTable::TTableClient client(driver);
     VerifyStatusOrSkip(NDump::DescribeExternalDataSource(client, dbPath, description), "error describing external data source");
     CanonizeForBackup(description);
-    const auto creationQuery = BuildCreateExternalDataSourceQuery(description, db);
+    const auto creationQuery = NDump::BuildCreateExternalDataSourceQuery(description, db);
 
     WriteCreationQueryToFile(creationQuery, fsBackupFolder, NDump::NFiles::CreateExternalDataSource());
     BackupPermissions(driver, dbPath, fsBackupFolder);
@@ -850,46 +818,6 @@ Ydb::Table::DescribeExternalTableResult DescribeExternalTable(TDriver driver, co
     return description;
 }
 
-namespace NExternalTable {
-
-    std::string PropertyToString(const std::pair<TProtoStringType, TProtoStringType>& property) {
-        const auto& [key, json] = property;
-        const auto items = NJson::ReadJsonFastTree(json).GetArray();
-        Y_ENSURE(!items.empty(), "Empty items for an external table property: " << key);
-        if (items.size() == 1) {
-            return ToString(key, items.front().GetString());
-        } else {
-            return ToString(key, std::format("[{}]", JoinSeq(", ", items).c_str()));
-        }
-    }
-
-}
-
-std::string ColumnToString(const Ydb::Table::ColumnMeta& column) {
-    const auto& type = column.type();
-    const bool notNull = !type.has_optional_type() || (type.has_pg_type() && column.not_null());
-    return std::format(
-        "    {} {}{}",
-        column.name().c_str(),
-        TType(type).ToString(),
-        notNull ? " NOT NULL" : ""
-    );
-}
-
-TString BuildCreateExternalTableQuery(const Ydb::Table::DescribeExternalTableResult& description) {
-    return std::format(
-        "CREATE EXTERNAL TABLE IF NOT EXISTS `{}` (\n{}\n) WITH (\n{},\n{}{}\n);",
-        description.self().name().c_str(),
-        JoinSeq(",\n", std::views::transform(description.columns(), ColumnToString)).c_str(),
-        ToString("DATA_SOURCE", description.data_source_path()),
-        ToString("LOCATION", description.location()),
-        description.content().empty()
-            ? ""
-            : std::string(",\n") +
-                JoinSeq(",\n", std::views::transform(description.content(), NExternalTable::PropertyToString)).c_str()
-    );
-}
-
 Ydb::Table::DescribeSystemViewResult DescribeSystemView(TDriver driver, const TString& path) {
     NTable::TTableClient client(driver);
     Ydb::Table::DescribeSystemViewResult description;
@@ -906,7 +834,7 @@ void BackupExternalTable(TDriver driver, const TString& dbPath, const TFsPath& f
     LOG_I("Backup external table " << dbPath.Quote() << " to " << fsBackupFolder.GetPath().Quote());
 
     const auto description = DescribeExternalTable(driver, dbPath);
-    const auto creationQuery = BuildCreateExternalTableQuery(description);
+    const auto creationQuery = NDump::BuildCreateExternalTableQuery(description);
 
     WriteCreationQueryToFile(creationQuery, fsBackupFolder, NDump::NFiles::CreateExternalTable());
     BackupPermissions(driver, dbPath, fsBackupFolder);

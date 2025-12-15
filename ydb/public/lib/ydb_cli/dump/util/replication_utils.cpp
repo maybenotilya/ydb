@@ -172,29 +172,6 @@ TString BuildCreateTransferQuery(
         );
 }
 
-namespace {
-
-bool IsSchemaSecret(TStringBuf secretName) {
-    return secretName.StartsWith('/');
-}
-
-bool RewriteSecretsNoCheck(TString& query, const TString& dbRestoreRoot, NYql::TIssues& issues) {
-    auto secretSettings = GetSecretSettings(query);
-    for (auto& secretSetting : secretSettings) {
-        if (IsSchemaSecret(secretSetting.Value)) {
-            secretSetting.Value = RewriteAbsolutePath(secretSetting.Value, GetDatabase(query), dbRestoreRoot);
-        }
-
-        if (!RewriteCreateQuery(query, secretSetting.Name + " = '{}'", secretSetting.Value, issues)) {
-           return false;
-        }
-    }
-
-    return true;
-}
-
-} // anonymous namespace
-
 bool RewriteCreateAsyncReplicationQueryNoSecrets(
     TString& query,
     const TString& dbRestoreRoot,
@@ -217,6 +194,30 @@ bool RewriteCreateAsyncReplicationQuery(
         return false;
     }
     return RewriteCreateAsyncReplicationQueryNoSecrets(query, dbRestoreRoot, dbPath, issues);
+}
+
+bool RewriteCreateTransferQueryNoSecrets(
+    TString& query,
+    const TString& dbRestoreRoot,
+    const TString& dbPath,
+    NYql::TIssues& issues) {
+
+    if (!RewriteObjectRefs(query, dbRestoreRoot, issues)) {
+        return false;
+    }
+    return RewriteCreateQuery(query, "CREATE TRANSFER `{}`", dbPath, issues);
+}
+
+bool RewriteCreateTransferQuery(
+    TString& query,
+    const TString& dbRestoreRoot,
+    const TString& dbPath,
+    NYql::TIssues& issues) {
+
+    if (!RewriteSecretsNoCheck(query, dbRestoreRoot, issues)) {
+        return false;
+    }
+    return RewriteCreateTransferQueryNoSecrets(query, dbRestoreRoot, dbPath, issues);
 }
 
 } // namespace NYdb::NDump
