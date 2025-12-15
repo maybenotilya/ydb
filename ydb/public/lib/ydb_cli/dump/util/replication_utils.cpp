@@ -147,8 +147,8 @@ TString BuildCreateTransferQuery(
     options.push_back(BuildOption("BATCH_SIZE_BYTES", ToString(batchingSettings.SizeBytes)));
     options.push_back(BuildOption("FLUSH_INTERVAL", Interval(batchingSettings.FlushInterval)));
 
-    const TString& lambdaCreateQuery = desc.GetTransformationLambda().c_str();
-    const TString& lambdaName = ExtractTransformationLambdaName(lambdaCreateQuery);
+    TString lambdaCreateQuery = desc.GetTransformationLambda().c_str();
+    TString lambdaName = ExtractTransformationLambdaName(lambdaCreateQuery);
 
     TString cleanedLambdaCreateQuery = lambdaCreateQuery;
     CleanQuery(cleanedLambdaCreateQuery, "PRAGMA OrderedColumns;");
