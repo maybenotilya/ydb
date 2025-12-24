@@ -154,8 +154,10 @@ TString BuildCreateTransferQuery(
     TVector<TString> options(::Reserve(7));
 
     const auto& connectionParams = desc.GetConnectionParams();
-    AddConnectionOptions(connectionParams, options);
-
+    // As connection params for transfer are not required
+    if (!connectionParams.GetDiscoveryEndpoint().empty() && !connectionParams.GetDatabase().empty()) {
+        AddConnectionOptions(connectionParams, options);
+    }
     options.push_back(BuildOption("CONSUMER", Quote(desc.GetConsumerName())));
 
     const auto& batchingSettings = desc.GetBatchingSettings();
@@ -176,7 +178,7 @@ TString BuildCreateTransferQuery(
         "CREATE TRANSFER `{}`\n"
         "FROM `{}` TO `{}` USING {}\n"
         "WITH (\n"
-        "  {}\n"
+        "{}\n"
         ");",
         db.c_str(),
         backupRoot.c_str(),
