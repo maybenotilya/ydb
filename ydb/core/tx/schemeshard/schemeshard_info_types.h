@@ -3029,7 +3029,7 @@ struct TExportInfo: public TSimpleRefCount<TExportInfo> {
 
     bool EnableChecksums = false;
     bool EnablePermissions = false;
-    bool MaterializeIndexes = false;
+    bool IncludeIndexData = false;
 
     NKikimrSchemeOp::TExportMetadata ExportMetadata;
     TActorId ExportMetadataUploader;
@@ -3207,7 +3207,7 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
     EState State = EState::Invalid;
     TString Issue;
     TVector<TItem> Items;
-    int WaitingViews = 0;
+    int WaitingSchemeObjects = 0;
 
     TSet<TActorId> Subscribers;
 
