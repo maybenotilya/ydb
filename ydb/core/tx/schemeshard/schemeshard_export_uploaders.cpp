@@ -223,6 +223,13 @@ class TKesusResourcesUploader : public TExportFilesUploader<TKesusResourcesUploa
         KesusPipeClient = Register(NTabletPipe::CreateClient(this->SelfId(), KesusTabletId, cfg));
     }
 
+    void ClosePipe() {
+        if (KesusPipeClient) {
+            NTabletPipe::CloseClient(this->SelfId(), KesusPipeClient);
+            KesusPipeClient = {};
+        }
+    }
+
     void GetAllResources() {
         using namespace NKesus;
         if (!KesusPipeClient) {
@@ -258,6 +265,7 @@ class TKesusResourcesUploader : public TExportFilesUploader<TKesusResourcesUploa
         Resources = std::move(*record.MutableResources());
         ResourcesKeys.reserve(Resources.size());
 
+        ClosePipe();
         UploadBatch();
     }
 
@@ -316,10 +324,7 @@ class TKesusResourcesUploader : public TExportFilesUploader<TKesusResourcesUploa
     }
 
     void PassAway() override {
-        if (KesusPipeClient) {
-            NTabletPipe::CloseClient(this->SelfId(), KesusPipeClient);
-            KesusPipeClient = {};
-        }
+        ClosePipe();
         TExportFilesUploader<TKesusResourcesUploader>::PassAway();
     }
 
