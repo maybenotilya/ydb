@@ -246,4 +246,19 @@ bool BuildRateLimiterResourceScheme(
     return google::protobuf::TextFormat::PrintToString(request, &scheme);
 }
 
+void BuildTransferScheme(
+    const NKikimrReplication::TEvDescribeReplicationResult& describeResult,
+    TString& scheme,
+    const TString& name,
+    const TString& databaseRoot)
+{
+    TString Scheme;
+    Ydb::Replication::DescribeTransferResult transferDesc;
+    FillTransferDescription(transferDesc, describeResult);
+
+    scheme = NYdb::NDump::BuildCreateTransferQuery(
+        databaseRoot, databaseRoot, name,
+        NYdb::NReplication::TTransferDescription(transferDesc));
+}
+
 } // namespace NKikimr::NSchemeShard
