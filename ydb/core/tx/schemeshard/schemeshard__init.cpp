@@ -4778,6 +4778,14 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         item.Changefeeds = rowset.GetValue<Schema::ImportItems::Changefeeds>();
                     }
 
+                    if (rowset.HaveValue<Schema::ImportItems::RateLimiters>()) {
+                        const auto& rateLimiters = rowset.GetValue<Schema::ImportItems::RateLimiters>();
+                        item.RateLimiters.assign(
+                            rateLimiters.GetRateLimiters().begin(),
+                            rateLimiters.GetRateLimiters().end()
+                        );
+                    }
+
                     if (rowset.HaveValue<Schema::ImportItems::Topic>()) {
                         Ydb::Topic::CreateTopicRequest topic;
                         Y_ABORT_UNLESS(ParseFromStringNoSizeLimit(topic, rowset.GetValue<Schema::ImportItems::Topic>()));
@@ -4790,10 +4798,18 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         item.SysView = sysView;
                     }
 
+                    if (rowset.HaveValue<Schema::ImportItems::Kesus>()) {
+                        Ydb::Coordination::CreateNodeRequest kesus;
+                        Y_ABORT_UNLESS(ParseFromStringNoSizeLimit(kesus, rowset.GetValue<Schema::ImportItems::Kesus>()));
+                        item.Kesus = kesus;
+                    }
+
                     item.State = static_cast<TImportInfo::EState>(rowset.GetValue<Schema::ImportItems::State>());
                     item.WaitTxId = rowset.GetValueOrDefault<Schema::ImportItems::WaitTxId>(InvalidTxId);
                     item.NextIndexIdx = rowset.GetValueOrDefault<Schema::ImportItems::NextIndexIdx>(0);
                     item.NextChangefeedIdx = rowset.GetValueOrDefault<Schema::ImportItems::NextChangefeedIdx>(0);
+                    item.NextRateLimiterIdx = rowset.GetValueOrDefault<Schema::ImportItems::NextRateLimiterIdx>(0);
+                    item.RateLimitersOffset = rowset.GetValueOrDefault<Schema::ImportItems::RateLimitersOffset>(0);
                     item.Issue = rowset.GetValueOrDefault<Schema::ImportItems::Issue>(TString());
                     item.SrcPrefix = rowset.GetValueOrDefault<Schema::ImportItems::SrcPrefix>(TString());
                     item.SrcPath = rowset.GetValueOrDefault<Schema::ImportItems::SrcPath>(TString());

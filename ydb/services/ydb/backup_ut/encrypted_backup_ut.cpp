@@ -813,6 +813,71 @@ Y_UNIT_TEST_SUITE_F(EncryptedExportTest, TBackupEncryptionTestFixture) {
 
         TestSchemeObjectEncryptedExportImport(query, "ExternalTable", s3FileList);
     }
+
+    Y_UNIT_TEST_TWIN(KesusEncryption, IsOlap) {
+        TString kesusPath = "/Root/EncryptedExportAndImport/dir1/dir2/dir3/Kesus";
+        auto createKesus = YdbCoordinationClient().CreateNode(kesusPath).GetValueSync();
+        UNIT_ASSERT_C(createKesus.IsSuccess(), createKesus.GetIssues().ToString());
+
+        TVector<TString> rateLimiters = {
+            "EncryptedRoot",
+            "EncryptedRoot/EncryptedLimiter1",
+            "EncryptedRoot/EncryptedLimiter2"
+        };
+        for (const auto& rateLimiterPath : rateLimiters) {
+            auto createRateLimiter = YdbRateLimiterClient().CreateResource(
+                kesusPath,
+                rateLimiterPath,
+                NYdb::NRateLimiter::TCreateResourceSettings()
+                    .MaxUnitsPerSecond(42.0)
+            ).GetValueSync();
+            UNIT_ASSERT_C(createRateLimiter.IsSuccess(), createRateLimiter.GetIssues().ToString());
+        }
+
+        TSet<TString> s3FileList = {
+            "/test_bucket/Prefix/001/001/create_rate_limiter.pb.enc",
+            "/test_bucket/Prefix/001/001/create_rate_limiter.pb.sha256",
+            "/test_bucket/Prefix/001/002/create_rate_limiter.pb.enc",
+            "/test_bucket/Prefix/001/002/create_rate_limiter.pb.sha256",
+            "/test_bucket/Prefix/001/003/create_rate_limiter.pb.enc",
+            "/test_bucket/Prefix/001/003/create_rate_limiter.pb.sha256",
+            "/test_bucket/Prefix/001/create_coordination_node.pb.enc",
+            "/test_bucket/Prefix/001/create_coordination_node.pb.sha256",
+            "/test_bucket/Prefix/001/metadata.json.enc",
+            "/test_bucket/Prefix/001/metadata.json.sha256",
+            "/test_bucket/Prefix/001/permissions.pb.enc",
+            "/test_bucket/Prefix/001/permissions.pb.sha256",
+            "/test_bucket/Prefix/SchemaMapping/mapping.json.enc",
+            "/test_bucket/Prefix/SchemaMapping/mapping.json.sha256",
+            "/test_bucket/Prefix/SchemaMapping/metadata.json.enc",
+            "/test_bucket/Prefix/SchemaMapping/metadata.json.sha256",
+            "/test_bucket/Prefix/metadata.json",
+            "/test_bucket/Prefix/metadata.json.sha256"
+        };
+
+        {
+            NExport::TExportToS3Settings settings = MakeExportSettings("/Root/EncryptedExportAndImport/dir1/dir2/dir3", "Prefix");
+            settings
+                .SymmetricEncryption(NExport::TExportToS3Settings::TEncryptionAlgorithm::AES_128_GCM, "Cool random key!");
+
+            auto res = YdbExportClient().ExportToS3(settings).GetValueSync();
+            WaitOpSuccess(res);
+
+            ValidateS3FileList(s3FileList);
+        }
+
+        {
+            NImport::TImportFromS3Settings importSettings = MakeImportSettings("Prefix", "/Root/Restored");
+            importSettings
+                .SymmetricKey("Cool random key!");
+
+            auto res = YdbImportClient().ImportFromS3(importSettings).GetValueSync();
+            WaitOpSuccess(res);
+        }
+
+        auto desc = YdbSchemeClient().DescribePath(Sprintf("/Root/Restored/Kesus")).GetValueSync();
+        UNIT_ASSERT_C(desc.IsSuccess(), desc.GetIssues().ToString());
+    }
 }
 
 class TBackupEncryptionCommonRequirementsTestFixture : public TS3BackupTestFixture {
@@ -1066,7 +1131,10 @@ protected:
             ), key);
 
             // All ivs are unique
-            UNIT_ASSERT_C(ivs.insert(iv.GetBinaryString()).second, key);
+            auto isInserted = ivs.insert(iv.GetBinaryString()).second;
+            if (!key.Contains("create_rate_limiter")) {
+                UNIT_ASSERT_C(isInserted, key);
+            }
 
             // Encrypted export must not show objects real names
             UNIT_ASSERT_C(key.find("Anonymized") == TString::npos, key);

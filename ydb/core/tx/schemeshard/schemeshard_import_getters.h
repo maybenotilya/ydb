@@ -9,6 +9,8 @@ namespace NSchemeShard {
 
 IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv);
 
+IActor* CreateRateLimitersGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv);
+
 IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo);
 
 IActor* CreateListObjectsInS3ExportGetter(TEvImport::TEvListObjectsInS3ExportRequest::TPtr&& ev);

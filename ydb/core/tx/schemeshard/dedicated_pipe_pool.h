@@ -15,7 +15,7 @@ class TDedicatedPipePool {
     TMap<TActorId, std::pair<TEntityId, TTabletId>> Owners;
 
 public:
-    void Send(const TEntityId& entityId, TTabletId dst, THolder<IEventBase> message, const TActorContext& ctx) {
+    void Send(const TEntityId& entityId, TTabletId dst, THolder<IEventBase> message, const TActorContext& ctx, ui64 cookie = 0) {
         using namespace NTabletPipe;
 
         if (!Pipes[entityId].contains(dst)) {
@@ -30,7 +30,7 @@ public:
 
         const auto clientId = Pipes[entityId][dst];
         Y_ABORT_UNLESS(Owners[clientId] == std::make_pair(entityId, dst));
-        SendData(ctx.SelfID, clientId, message.Release(), 0);
+        SendData(ctx.SelfID, clientId, message.Release(), cookie);
     }
 
     void Close(const TEntityId& entityId, TTabletId dst, const TActorContext& ctx) {

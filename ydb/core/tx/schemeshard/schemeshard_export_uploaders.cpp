@@ -49,11 +49,12 @@ TString GetDestinationPrefix(const TSettings& settings, ui32 itemIdx) {
 
 TMaybe<NBackup::TEncryptionIV> MakeIV(
     const TMaybe<NBackup::TEncryptionIV>& IV,
-    NBackup::EBackupFileType fileType)
+    NBackup::EBackupFileType fileType,
+    ui32 shardNumber = 0)
 {
     TMaybe<NBackup::TEncryptionIV> iv;
     if (IV) {
-        iv = NBackup::TEncryptionIV::Combine(*IV, fileType, 0 /* backupItemNumber: already combined */, 0 /* shardNumber */);
+        iv = NBackup::TEncryptionIV::Combine(*IV, fileType, 0 /* backupItemNumber: already combined */, shardNumber);
     }
     return iv;
 }
@@ -314,8 +315,8 @@ class TKesusResourcesUploader : public TSchemeWithPipeUploader<TKesusResourcesUp
         UploadBatch();
     }
 
-    bool AddFiles(const TString& fileName, const TString& content) {
-        if (!this->AddFile(fileName, content, MakeIV(IV, NBackup::EBackupFileType::CoordinationNodeCreateRateLimiter))) {
+    bool AddFiles(const TString& fileName, const TString& content, ui32 resourceIndex) {
+        if (!this->AddFile(fileName, content, MakeIV(IV, NBackup::EBackupFileType::CoordinationNodeCreateRateLimiter, resourceIndex))) {
             return false;
         }
 
@@ -347,7 +348,7 @@ class TKesusResourcesUploader : public TSchemeWithPipeUploader<TKesusResourcesUp
             ResourcesMetadata.push_back({prefix.str(), resource.GetResourcePath()});
             prefix << '/' << NYdb::NDump::NFiles::CreateRateLimiter().FileName;
 
-            if (!AddFiles(prefix.str(), scheme)) {
+            if (!AddFiles(prefix.str(), scheme, resourceIdx)) {
                 return;
             }
         }
@@ -546,7 +547,8 @@ class TSchemeUploader: public TExportFilesUploader<TSchemeUploader<TSettings>, T
             this->Send(uploader, new TEvents::TEvPoisonPill());
         }
 
-        this->ScheduleRetry(TDuration::Seconds(2));
+        KesusResourcesUploadDelay = Min(KesusResourcesUploadDelay * ++KesusResourcesUploadAttempts, TBase::MaxDelay);
+        this->ScheduleRetry(KesusResourcesUploadDelay);
     }
 
     void StartUploadFiles() {
@@ -686,6 +688,7 @@ private:
 
     TActorId KesusResourcesUploader;
     ui32 KesusResourcesUploadAttempts = 0;
+    TDuration KesusResourcesUploadDelay = TDuration::Seconds(10);
     const ui32 MaxKesusResourcesUploadAttempts = 10;
 }; // TSchemeUploader
 

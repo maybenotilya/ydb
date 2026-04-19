@@ -13,6 +13,7 @@
 #include <ydb/core/base/tx_processing.h>
 #include <ydb/core/engine/minikql/flat_local_tx_factory.h>
 #include <ydb/core/engine/mkql_proto.h>
+#include <ydb/core/kesus/tablet/events.h>
 #include <ydb/core/keyvalue/keyvalue_events.h>
 #include <ydb/core/protos/auth.pb.h>
 #include <ydb/core/protos/feature_flags.pb.h>
@@ -41,6 +42,7 @@
 #include <yql/essentials/providers/common/proto/gateways_config.pb.h>
 
 #include <util/random/random.h>
+#include <util/string/join.h>
 #include <util/system/byteorder.h>
 #include <util/system/unaligned_mem.h>
 
@@ -5144,6 +5146,9 @@ void TSchemeShard::Die(const TActorContext &ctx) {
     for (TActorId schemeQueryExecutor : RunningImportSchemeQueryExecutors) {
         ctx.Send(schemeQueryExecutor, new TEvents::TEvPoisonPill());
     }
+    for (TActorId rateLimiterGetter : RunningImportRateLimitersGetters) {
+        ctx.Send(rateLimiterGetter, new TEvents::TEvPoisonPill());
+    }
     for (TActorId continuousBackupCleaner : RunningContinuousBackupCleaners) {
         ctx.Send(continuousBackupCleaner, new TEvents::TEvPoisonPill());
     }
@@ -5153,6 +5158,7 @@ void TSchemeShard::Die(const TActorContext &ctx) {
     CdcStreamScanPipes.Shutdown(ctx);
     ShardDeleter.Shutdown(ctx);
     ParentDomainLink.Shutdown(ctx);
+    KesusImportPipes.Shutdown(ctx);
 
     if (SAPipeClientId) {
         NTabletPipe::CloseClient(SelfId(), SAPipeClientId);
@@ -5446,6 +5452,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvBlockStore::TEvUpdateVolumeConfigResponse, Handle);
         HFuncTraced(TEvFileStore::TEvUpdateConfigResponse, Handle);
         HFuncTraced(NKesus::TEvKesus::TEvSetConfigResult, Handle);
+        HFuncTraced(NKesus::TEvKesus::TEvAddQuoterResourceResult, Handle);
         HFuncTraced(TEvPersQueue::TEvDropTabletReply, Handle);
         HFuncTraced(TEvPersQueue::TEvUpdateConfigResponse, Handle);
         HFuncTraced(TEvPersQueue::TEvProposeTransactionResult, Handle);
@@ -5478,6 +5485,8 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvPrivate::TEvImportSchemeReady, Handle);
         HFuncTraced(TEvPrivate::TEvImportSchemaMappingReady, Handle);
         HFuncTraced(TEvPrivate::TEvImportSchemeQueryResult, Handle);
+        HFuncTraced(TEvPrivate::TEvImportRateLimitersSchemeReady, Handle);
+        HFuncTraced(TEvPrivate::TEvImportCreateRateLimiterResult, Handle);
         // } // NImport
 
         // namespace NBackup {
@@ -6294,6 +6303,18 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientConnected::TPtr &ev, const TAc
         return;
     }
 
+    if (KesusImportPipes.Has(clientId)) {
+        auto owner = KesusImportPipes.GetOwnerId(clientId);
+        auto kesusTabletId = KesusImportPipes.GetTabletId(clientId);
+        KesusImportPipes.Close(owner, kesusTabletId, ctx);
+        std::erase_if(ImportRateLimiterByCookie, [&owner](const auto& kv) {
+            return kv.second == owner;
+        });
+        auto [id, itemIdx] = owner;
+        Execute(CreateTxProgressImport(id, itemIdx), ctx);
+        return;
+    }
+
     if (ParentDomainLink.HasPipeTo(tabletId, clientId)) {
         ParentDomainLink.AtPipeError(ctx);
         return;
@@ -6361,6 +6382,18 @@ void TSchemeShard::Handle(TEvTabletPipe::TEvClientDestroyed::TPtr &ev, const TAc
 
     if (ParentDomainLink.HasPipeTo(tabletId, clientId)) {
         ParentDomainLink.AtPipeError(ctx);
+        return;
+    }
+
+    if (KesusImportPipes.Has(clientId)) {
+        auto owner = KesusImportPipes.GetOwnerId(clientId);
+        auto kesusTabletId = KesusImportPipes.GetTabletId(clientId);
+        KesusImportPipes.Close(owner, kesusTabletId, ctx);
+        std::erase_if(ImportRateLimiterByCookie, [&owner](const auto& kv) {
+            return kv.second == owner;
+        });
+        auto [id, itemIdx] = owner;
+        Execute(CreateTxProgressImport(id, itemIdx), ctx);
         return;
     }
 
@@ -7094,6 +7127,25 @@ void TSchemeShard::Handle(NKesus::TEvKesus::TEvSetConfigResult::TPtr& ev, const 
     }
 
     Execute(CreateTxOperationReply(opId, ev), ctx);
+}
+
+void TSchemeShard::Handle(NKesus::TEvKesus::TEvAddQuoterResourceResult::TPtr& ev, const TActorContext& ctx) {
+    const auto cookieIt = ImportRateLimiterByCookie.find(ev->Cookie);
+    if (cookieIt == ImportRateLimiterByCookie.end()) {
+        // Stale response (e.g., the import was cancelled, or this is a duplicate
+        // reply after a retry). Ignore.
+        LOG_DEBUG_S(ctx, NKikimrServices::FLAT_TX_SCHEMESHARD,
+            "Ignoring stale TEvAddQuoterResourceResult: cookie# " << ev->Cookie);
+        return;
+    }
+    const auto [importId, itemIdx] = cookieIt->second;
+    ImportRateLimiterByCookie.erase(cookieIt);
+
+    const auto& record = ev->Get()->Record;
+    Send(SelfId(), new TEvPrivate::TEvImportCreateRateLimiterResult(
+        importId, itemIdx,
+        record.GetError().GetStatus(),
+        JoinSeq(',', record.GetError().GetIssues())));
 }
 
 TOperationId TSchemeShard::RouteIncoming(TTabletId tabletId, const TActorContext& ctx) {

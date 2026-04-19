@@ -110,6 +110,11 @@ namespace {
         return schemeStr;
     }
 
+    void AddRateLimiterToS3(TS3Mock& s3Mock, const TString& sourcePrefix, const TString& scheme) {
+        s3Mock.GetData()[sourcePrefix + "/create_rate_limiter.pb"] = scheme;
+        s3Mock.GetData()[sourcePrefix + "/create_rate_limiter.pb.sha256"] = NBackup::ComputeChecksum(scheme);
+    }
+
     struct TDataWithChecksum {
         TString Data;
         TString Checksum;
@@ -200,6 +205,7 @@ namespace {
         TDataWithChecksum SysViewDescription;
         TDataWithChecksum Permissions;
         TImportChangefeed Changefeed;
+        TDataWithChecksum Kesus;
         TVector<TTestData> Data;
         TDataWithChecksum Topic;
 
@@ -339,6 +345,9 @@ namespace {
         case EPathTypePersQueueGroup:
             result.Topic = typedScheme.Scheme;
             break;
+        case EPathTypeKesus:
+            result.Kesus = typedScheme.Scheme;
+            break;
         default:
             UNIT_FAIL("cannot create sample test data for the scheme object type: " << typedScheme.Type);
             return {};
@@ -437,6 +446,14 @@ namespace {
                 result.emplace(topicKey, item.Topic);
                 if (withChecksum) {
                     result.emplace(NBackup::ChecksumKey(topicKey), item.Topic.Checksum);
+                }
+                break;
+            }
+            case EPathTypeKesus: {
+                auto kesusKey = prefix +  "/create_coordination_node.pb";
+                result.emplace(kesusKey, item.Kesus);
+                if (withChecksum) {
+                    result.emplace(NBackup::ChecksumKey(kesusKey), item.Kesus.Checksum);
                 }
                 break;
             }
@@ -7646,6 +7663,169 @@ Y_UNIT_TEST_SUITE(TImportTests) {
         TestGetImport(runtime, txId, "/MyRoot", Ydb::StatusIds::CANCELLED);
     }
 
+    void CheckRateLimiterExists(TTestBasicRuntime& runtime, const TString& kesusPath, const TSet<TString>& rateLimiters) {
+        using namespace NKesus;
+
+        auto desc = TestDescribe(runtime, kesusPath);
+        NKikimrScheme::TEvDescribeSchemeResult descResult;
+        UNIT_ASSERT(google::protobuf::TextFormat::ParseFromString(desc, &descResult));
+
+        ui64 kesusTabletId = descResult.GetPathDescription().GetKesus().GetKesusTabletId();
+
+        THolder<TEvKesus::TEvDescribeQuoterResources> req = MakeHolder<TEvKesus::TEvDescribeQuoterResources>();
+        req->Record.SetRecursive(true);
+
+        TBlockEvents<TEvKesus::TEvDescribeQuoterResourcesResult> blockDesc(runtime, [&](const TEvKesus::TEvDescribeQuoterResourcesResult::TPtr& ev) {
+            const auto& record = ev->Get()->Record;
+            TSet<TString> resources;
+            for (const auto& resource : record.GetResources()) {
+                resources.insert(resource.GetResourcePath());
+            }
+            TSet<TString> diff;
+            std::ranges::set_difference(rateLimiters, resources, std::inserter(diff, diff.begin()));
+            UNIT_ASSERT_C(diff.empty(), TStringBuilder() << "Rate limiters not found: " << JoinSeq(',', diff));
+            return true;
+        });
+
+        AsyncSend(runtime, kesusTabletId, req.Release());
+
+        runtime.WaitFor(
+            "get resources",
+            [&]{ return blockDesc.size() >= 1; }
+        );
+
+        blockDesc.Unblock();
+    }
+
+    Y_UNIT_TEST(KesusImport) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true);
+        TTestEnv env(runtime, options);
+        runtime.SetLogPriority(NKikimrServices::IMPORT, NActors::NLog::PRI_TRACE);
+        ui64 txId = 100;
+
+        THashMap<TString, TTestDataWithScheme> bucketContent(1);
+        bucketContent.emplace("/Kesus", GenerateTestData(
+            {
+                EPathTypeKesus,
+                R"(
+                    config {
+                        self_check_period_millis: 1234
+                        session_grace_period_millis: 5678
+                    }
+                )"
+            }
+        ));
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+
+        TS3Mock s3Mock(ConvertTestData(bucketContent), TS3Mock::TSettings(port));
+        TSet<TString> resources = { "root", "root/child1", "root/child2", "root/child2/child3" };
+        for (const auto& path : resources) {
+            AddRateLimiterToS3(s3Mock, Sprintf("/Kesus/%s", path.c_str()), Sprintf(R"(
+                resource {
+                    resource_path: "%s"
+                    hierarchical_drr {
+                        max_units_per_second: 11.1
+                    }
+                }
+            )", path.c_str()));
+        }
+        UNIT_ASSERT(s3Mock.Start());
+
+        TestImport(runtime, ++txId, "/MyRoot", Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "Kesus"
+                destination_path: "/MyRoot/Kesus"
+              }
+            }
+        )", port));
+
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot");
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/Kesus"), {
+            NLs::Finished,
+            NLs::KesusConfigIs(1234, 5678),
+        });
+
+        CheckRateLimiterExists(runtime, "/MyRoot/Kesus", resources);
+    }
+
+    Y_UNIT_TEST(KesusExportImport) {
+        TTestBasicRuntime runtime;
+        auto options = TTestEnvOptions()
+            .RunFakeConfigDispatcher(true);
+        TTestEnv env(runtime, options);
+        runtime.SetLogPriority(NKikimrServices::IMPORT, NActors::NLog::PRI_TRACE);
+        ui64 txId = 100;
+
+        TestCreateKesus(runtime, ++txId, "/MyRoot", R"(
+            Name: "Kesus"
+            Config: { self_check_period_millis: 1234 session_grace_period_millis: 5678 }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        TSet<TString> resources = { "root", "root/child1", "root/child2", "root/child2/child3" };
+        for (const auto& path : resources) {
+            TestCreateRateLimiter(runtime, "/MyRoot/Kesus", Sprintf(R"(
+            Resource {
+                ResourcePath: "%s"
+                HierarchicalDRRResourceConfig {
+                    MaxUnitsPerSecond: 11.1
+                }
+            })", path.c_str()));
+        }
+
+        TPortManager portManager;
+        const ui16 port = portManager.GetPort();
+
+        TS3Mock s3Mock({}, TS3Mock::TSettings(port));
+        UNIT_ASSERT(s3Mock.Start());
+
+        TString exportRequest = Sprintf(R"(
+            ExportToS3Settings {
+                endpoint: "localhost:%d"
+                scheme: HTTP
+                items {
+                    source_path: "/MyRoot/Kesus"
+                    destination_prefix: "Kesus"
+                }
+            }
+        )", port);
+
+        TestExport(runtime, ++txId, "/MyRoot", exportRequest);
+        env.TestWaitNotification(runtime, txId);
+        TestGetExport(runtime, txId, "/MyRoot");
+
+        TString importRequest = Sprintf(R"(
+            ImportFromS3Settings {
+              endpoint: "localhost:%d"
+              scheme: HTTP
+              items {
+                source_prefix: "Kesus"
+                destination_path: "/MyRoot/NewKesus"
+              }
+            }
+        )", port);
+
+        TestImport(runtime, ++txId, "/MyRoot", importRequest);
+        env.TestWaitNotification(runtime, txId);
+        TestGetImport(runtime, txId, "/MyRoot");
+
+        TestDescribeResult(DescribePath(runtime, "/MyRoot/NewKesus"), {
+            NLs::Finished,
+            NLs::KesusConfigIs(1234, 5678),
+        });
+
+        CheckRateLimiterExists(runtime, "/MyRoot/Kesus", resources);
+    }
+
     Y_UNIT_TEST(ShouldRestoreSystemViewPermissions) {
         TTestBasicRuntime runtime;
         TTestEnv env(runtime);
@@ -7845,10 +8025,30 @@ Y_UNIT_TEST_SUITE(TImportWithRebootsTests) {
         const TString& extraSettings = "")
     {
         THashMap<TString, TTestDataWithScheme> bucketContent(schemes.size());
+        TVector<TString> kesuses;
         for (const auto& [prefix, typedScheme] : schemes) {
+            if (typedScheme.Type == EPathTypeKesus) {
+                kesuses.push_back(prefix);
+            }
             bucketContent.emplace(prefix, GenerateTestData(typedScheme));
         }
-        TImportEnv<IsFs> env(ConvertTestData(bucketContent), items, extraSettings);
+        auto flatData = ConvertTestData(bucketContent);
+        for (const auto& prefix : kesuses) {
+            for (ui32 i : xrange(10)) {
+                const TString sourcePrefix = Sprintf("%s/root%u", prefix.c_str(), i);
+                const TString scheme = Sprintf(R"(
+                    resource {
+                        resource_path: "root%u"
+                        hierarchical_drr {
+                            max_units_per_second: 11.1
+                        }
+                    }
+                )", i);
+                flatData[sourcePrefix + "/create_rate_limiter.pb"] = scheme;
+                flatData[sourcePrefix + "/create_rate_limiter.pb.sha256"] = NBackup::ComputeChecksum(scheme);
+            }
+        }
+        TImportEnv<IsFs> env(flatData, items, extraSettings);
 
         const bool createdByQuery = AnyOf(schemes, [](const auto& scheme) {
             return scheme.second.Scheme.Contains("CREATE"); // Hack
@@ -7891,6 +8091,20 @@ Y_UNIT_TEST_SUITE(TImportWithRebootsTests) {
     template <bool IsFs>
     void ShouldSucceed(TTestWithReboots& t, const TTypedScheme& scheme) {
         ShouldSucceed<IsFs>(t, {{"", scheme}});
+    }
+
+    Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(ShouldSucceedOnSingleKesus, 2, 1, false, IsFs) {
+        ShouldSucceed<IsFs>(t,
+            {
+                EPathTypeKesus,
+                R"(
+                    config {
+                        self_check_period_millis: 1234
+                        session_grace_period_millis: 5678
+                    }
+                )"
+            }
+        );
     }
 
     Y_UNIT_TEST_WITH_REBOOTS_BUCKETS_TWIN(ShouldSucceedOnSimpleTable, 2, 1, false, IsFs) {

@@ -25,7 +25,9 @@ namespace TEvPrivate {
         EvIndexBuildBilling,
         EvImportSchemeReady,
         EvImportSchemaMappingReady,
+        EvImportRateLimitersSchemeReady,
         EvImportSchemeQueryResult,
+        EvImportCreateRateLimiterResult,
         EvExportSchemeUploadResult,
         EvExportUploadMetadataResult,
         EvExportUploadKesusResourcesResult,
@@ -140,6 +142,20 @@ namespace TEvPrivate {
         {}
     };
 
+    struct TEvImportRateLimitersSchemeReady: public TEventLocal<TEvImportRateLimitersSchemeReady, EvImportRateLimitersSchemeReady> {
+        const ui64 ImportId;
+        const ui32 ItemIdx;
+        const bool Success;
+        const TString Error;
+
+        TEvImportRateLimitersSchemeReady(ui64 id, ui32 itemIdx, bool success, const TString& error)
+            : ImportId(id)
+            , ItemIdx(itemIdx)
+            , Success(success)
+            , Error(error)
+        {}
+    };
+
     struct TEvImportSchemeQueryResult: public TEventLocal<TEvImportSchemeQueryResult, EvImportSchemeQueryResult> {
         const ui64 ImportId;
         const ui32 ItemIdx;
@@ -160,6 +176,20 @@ namespace TEvPrivate {
             , ItemIdx(itemIdx)
             , Status(status)
             , Result(preparedQuery)
+        {}
+    };
+
+    struct TEvImportCreateRateLimiterResult: public TEventLocal<TEvImportCreateRateLimiterResult, EvImportCreateRateLimiterResult> {
+        const ui64 ImportId;
+        const ui32 ItemIdx;
+        const Ydb::StatusIds::StatusCode Status;
+        const TString Error;
+
+        TEvImportCreateRateLimiterResult(ui64 id, ui32 itemIdx, Ydb::StatusIds::StatusCode status, const TString& error)
+            : ImportId(id)
+            , ItemIdx(itemIdx)
+            , Status(status)
+            , Error(error)
         {}
     };
 

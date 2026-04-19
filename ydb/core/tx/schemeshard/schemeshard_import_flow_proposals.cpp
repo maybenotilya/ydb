@@ -8,6 +8,7 @@
 #include <ydb/core/persqueue/public/schema/schema_propose.h>
 #include <ydb/core/protos/s3_settings.pb.h>
 #include <ydb/core/protos/fs_settings.pb.h>
+#include <ydb/core/ydb_convert/kesus_description.h>
 #include <ydb/core/ydb_convert/table_description.h>
 #include <ydb/core/ydb_convert/topic_description.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
@@ -537,6 +538,46 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTopicPropose(
         return nullptr;
     }
 
+    return propose;
+}
+
+THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateKesusPropose(
+    TSchemeShard* ss,
+    TTxId txId,
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TString& error
+) {
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    const auto& item = importInfo.Items.at(itemIdx);
+    Y_ABORT_UNLESS(item.Kesus);
+
+    auto propose = MakeModifySchemeTransaction(ss, txId, importInfo);
+    auto& record = propose->Record;
+
+    auto& modifyScheme = *record.AddTransaction();
+
+    const TPath domainPath = TPath::Init(importInfo.DomainPathId, ss);
+    std::pair<TString, TString> wdAndPath;
+    if (!TrySplitPathByDb(item.DstPathName, domainPath.PathString(), wdAndPath, error)) {
+        return nullptr;
+    }
+
+    modifyScheme.SetWorkingDir(wdAndPath.first);
+    modifyScheme.SetOperationType(NKikimrSchemeOp::EOperationType::ESchemeOpCreateKesus);
+
+    FillKesusDescription(*modifyScheme.MutableKesus(), item.Kesus->Getconfig(), wdAndPath.second);
+
+    return propose;
+}
+
+THolder<NKesus::TEvKesus::TEvAddQuoterResource> CreateRateLimiterPropose(
+    const Ydb::RateLimiter::CreateResourceRequest& request
+) {
+    auto propose = MakeHolder<NKesus::TEvKesus::TEvAddQuoterResource>();
+    auto& record = propose->Record;
+
+    FillRateLimiterDescription(*record.MutableResource(), request.resource());
     return propose;
 }
 

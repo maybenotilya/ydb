@@ -14,6 +14,7 @@
 #include <ydb/public/api/protos/ydb_cms.pb.h>
 #include <ydb/public/api/protos/ydb_coordination.pb.h>
 #include <ydb/public/api/protos/ydb_import.pb.h>
+#include <ydb/public/api/protos/ydb_rate_limiter.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
 #include <ydb/public/lib/scheme_types/scheme_type_id.h>
 
@@ -3517,6 +3518,7 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         BuildIndexes = 5,
         CreateChangefeed = 6,
         DownloadExportMetadata = 7,
+        CreateRateLimiterResources = 8,
         Done = 240,
         Cancellation = 250,
         Cancelled = 251,
@@ -3546,12 +3548,14 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         TMaybe<Ydb::Table::CreateTableRequest> Table;
         TMaybe<Ydb::Topic::CreateTopicRequest> Topic;
         TMaybe<Ydb::Table::DescribeSystemViewResult> SysView;
+        TMaybe<Ydb::Coordination::CreateNodeRequest> Kesus;
         TString CreationQuery;
         TMaybe<NKikimrSchemeOp::TModifyScheme> PreparedCreationQuery;
         TMaybeFail<Ydb::Scheme::ModifyPermissionsRequest> Permissions;
         NBackup::TMetadata Metadata;
         TVector<std::pair<NBackup::TIndexMetadata, Ydb::Table::CreateTableRequest>> MaterializedIndexes;
         NKikimrSchemeOp::TImportTableChangefeeds Changefeeds;
+        TVector<Ydb::RateLimiter::CreateResourceRequest> RateLimiters;
 
         EState State = EState::GetScheme;
         ESubState SubState = ESubState::AllocateTxId;
@@ -3559,8 +3563,12 @@ struct TImportInfo: public TSimpleRefCount<TImportInfo> {
         TTxId WaitTxId = InvalidTxId;
         TActorId SchemeGetter;
         TActorId SchemeQueryExecutor;
+        TActorId RateLimitersGetter;
         int NextIndexIdx = 0;
         int NextChangefeedIdx = 0;
+        int NextRateLimiterIdx = 0;
+        int RateLimitersOffset = 0;
+        int RateLimitersBatchSize = 100;
         TString Issue;
         TPathId StreamImplPathId;
         TMaybe<NBackup::TEncryptionIV> ExportItemIV;

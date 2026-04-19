@@ -69,5 +69,17 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateTopicPropose(
     TString& error
 );
 
+THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateKesusPropose(
+    TSchemeShard* ss,
+    TTxId txId,
+    const TImportInfo& importInfo,
+    ui32 itemIdx,
+    TString& error
+);
+
+THolder<NKesus::TEvKesus::TEvAddQuoterResource> CreateRateLimiterPropose(
+    const Ydb::RateLimiter::CreateResourceRequest& request
+);
+
 } // NSchemeShard
 } // NKikimr

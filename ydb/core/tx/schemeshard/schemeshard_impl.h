@@ -1441,6 +1441,7 @@ public:
     void Handle(TEvBlockStore::TEvUpdateVolumeConfigResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvFileStore::TEvUpdateConfigResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(NKesus::TEvKesus::TEvSetConfigResult::TPtr& ev, const TActorContext& ctx);
+    void Handle(NKesus::TEvKesus::TEvAddQuoterResourceResult::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvInitTenantSchemeShardResult::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvPublishTenantAsReadOnly::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvSchemeShard::TEvPublishTenantAsReadOnlyResult::TPtr& ev, const TActorContext& ctx);
@@ -1598,6 +1599,11 @@ public:
     THashMap<TTxId, std::pair<ui64, ui32>> TxIdToImport;
     THashSet<TActorId> RunningImportSchemeGetters;
     THashSet<TActorId> RunningImportSchemeQueryExecutors;
+    THashSet<TActorId> RunningImportRateLimitersGetters;
+
+    TDedicatedPipePool<std::pair<ui64 /* ImportId */, ui32 /* ItemIdx */>> KesusImportPipes;
+    ui64 LastImportRateLimiterCookie = 0;
+    std::unordered_map<ui64 /* cookie */, std::pair<ui64 /* ImportId */, ui32 /* ItemIdx */>> ImportRateLimiterByCookie;
 
     void FromXxportInfo(NKikimrImport::TImport& exprt, const TImportInfo& importInfo);
     void AddImport(const TImportInfo::TPtr& importInfo);
@@ -1640,6 +1646,8 @@ public:
     NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TEvTxAllocatorClient::TEvAllocateResult::TPtr& ev);
     NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TEvSchemeShard::TEvModifySchemeTransactionResult::TPtr& ev);
     NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TEvIndexBuilder::TEvCreateResponse::TPtr& ev);
+    NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr& ev);
+    NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TEvPrivate::TEvImportCreateRateLimiterResult::TPtr& ev);
     NTabletFlatExecutor::ITransaction* CreateTxProgressImport(TTxId completedTxId);
 
     void Handle(TEvImport::TEvCreateImportRequest::TPtr& ev, const TActorContext& ctx);
@@ -1651,6 +1659,8 @@ public:
     void Handle(TEvPrivate::TEvImportSchemeReady::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvImportSchemaMappingReady::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvPrivate::TEvImportSchemeQueryResult::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvPrivate::TEvImportCreateRateLimiterResult::TPtr& ev, const TActorContext& ctx);
 
     void ResumeImports(const TVector<ui64>& ids, const TActorContext& ctx);
     // } // NImport

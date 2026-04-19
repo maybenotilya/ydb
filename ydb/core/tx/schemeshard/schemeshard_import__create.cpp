@@ -474,6 +474,8 @@ struct TSchemeShard::TImport::TTxProgress: public TSchemeShard::TXxport::TTxBase
     TEvTxAllocatorClient::TEvAllocateResult::TPtr AllocateResult = nullptr;
     TEvSchemeShard::TEvModifySchemeTransactionResult::TPtr ModifyResult = nullptr;
     TEvIndexBuilder::TEvCreateResponse::TPtr CreateIndexResult = nullptr;
+    TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr RateLimitersSchemeResult = nullptr;
+    TEvPrivate::TEvImportCreateRateLimiterResult::TPtr CreateRateLimiterResult = nullptr;
     TTxId CompletedTxId = InvalidTxId;
 
     explicit TTxProgress(TSelf* self, ui64 id, const TMaybe<ui32>& itemIdx)
@@ -520,6 +522,18 @@ struct TSchemeShard::TImport::TTxProgress: public TSchemeShard::TXxport::TTxBase
     {
     }
 
+    explicit TTxProgress(TSelf* self, TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr& ev)
+        : TXxport::TTxBase(self)
+        , RateLimitersSchemeResult(ev)
+    {
+    }
+
+    explicit TTxProgress(TSelf* self, TEvPrivate::TEvImportCreateRateLimiterResult::TPtr& ev)
+        : TXxport::TTxBase(self)
+        , CreateRateLimiterResult(ev)
+    {
+    }
+
     explicit TTxProgress(TSelf* self, TTxId completedTxId)
         : TXxport::TTxBase(self)
         , CompletedTxId(completedTxId)
@@ -545,6 +559,10 @@ struct TSchemeShard::TImport::TTxProgress: public TSchemeShard::TXxport::TTxBase
             OnModifyResult(txc, ctx);
         } else if (CreateIndexResult) {
             OnCreateIndexResult(txc, ctx);
+        } else if (RateLimitersSchemeResult) {
+            OnRateLimitersSchemeResult(txc, ctx);
+        } else if (CreateRateLimiterResult) {
+            OnCreateRateLimiterResult(txc, ctx);
         } else if (CompletedTxId) {
             OnNotifyResult(txc, ctx);
         } else {
@@ -727,6 +745,28 @@ private:
         return true;
     }
 
+    bool CreateKesus(TImportInfo& importInfo, ui32 itemIdx, TTxId txId, TString& error) {
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        auto& item = importInfo.Items.at(itemIdx);
+
+        item.SubState = ESubState::Proposed;
+
+        LOG_I("TImport::TTxProgress: CreateKesus propose"
+            << ": info# " << importInfo.ToString()
+            << ", item# " << item.ToString(itemIdx)
+            << ", txId# " << txId);
+
+        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
+
+        auto propose = CreateKesusPropose(Self, txId, importInfo, itemIdx, error);
+        if (!propose) {
+            return false;
+        }
+
+        Send(Self->SelfId(), std::move(propose));
+        return true;
+    }
+
     void ExecutePreparedQuery(TTransactionContext& txc, TImportInfo::TPtr importInfo, ui32 itemIdx, TTxId txId) {
         Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
         auto& item = importInfo->Items[itemIdx];
@@ -832,6 +872,39 @@ private:
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
         Send(Self->SelfId(), RestoreTableDataPropose(Self, txId, importInfo, itemIdx));
+    }
+
+    void GetRateLimiters(TImportInfo::TPtr importInfo, ui32 itemIdx, const TActorContext& ctx) {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items.at(itemIdx);
+
+        LOG_I("TImport::TTxProgress: Get rate limiters"
+            << ": info# " << importInfo->ToString()
+            << ", item# " << item.ToString(itemIdx));
+
+        item.RateLimiters.clear();
+        item.RateLimitersGetter = ctx.RegisterWithSameMailbox(CreateRateLimitersGetter(Self->SelfId(), importInfo, itemIdx, item.ExportItemIV));
+        Self->RunningImportRateLimitersGetters.emplace(item.RateLimitersGetter);
+    }
+
+    void CreateRateLimiter(TImportInfo::TPtr importInfo, ui32 itemIdx, const TActorContext& ctx) {
+        Y_ABORT_UNLESS(itemIdx < importInfo->Items.size());
+        auto& item = importInfo->Items.at(itemIdx);
+
+        LOG_I("TImport::TTxProgress: CreateNextRateLimiter"
+            << ": info# " << importInfo->ToString()
+            << ", item# " << item.ToString(itemIdx)
+            << ", scheme# " << item.RateLimiters.at(item.NextRateLimiterIdx).DebugString());
+
+        Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
+
+        auto propose = CreateRateLimiterPropose(item.RateLimiters.at(item.NextRateLimiterIdx));
+
+        Y_ABORT_UNLESS(Self->KesusInfos.contains(item.DstPathId));
+        TTabletId kesusTabletId = Self->KesusInfos.at(item.DstPathId)->KesusTabletId;
+        const ui64 cookie = ++Self->LastImportRateLimiterCookie;
+        Self->ImportRateLimiterByCookie[cookie] = {importInfo->Id, itemIdx};
+        Self->KesusImportPipes.Send({importInfo->Id, itemIdx}, kesusTabletId, std::move(propose), ctx, cookie);
     }
 
     bool CancelTransferring(TImportInfo& importInfo, ui32 itemIdx) {
@@ -1039,6 +1112,10 @@ private:
             Send(schemeQueryExecutor, new TEvents::TEvPoisonPill());
             Self->RunningImportSchemeQueryExecutors.erase(schemeQueryExecutor);
         }
+        if (auto rateLimitersGetter = std::exchange(item.RateLimitersGetter, {})) {
+            Send(rateLimitersGetter, new TEvents::TEvPoisonPill());
+            Self->RunningImportRateLimitersGetters.erase(rateLimitersGetter);
+        }
     }
 
     void Cancel(TImportInfo& importInfo, ui32 itemIdx, TStringBuf marker) {
@@ -1240,7 +1317,12 @@ private:
                         SubscribeTx(*importInfo, itemIdx);
                     }
                     break;
-
+                case EState::CreateRateLimiterResources:
+                    if (!item.RateLimiters.empty() && item.NextRateLimiterIdx < static_cast<int>(item.RateLimiters.size())) {
+                        CreateRateLimiter(importInfo, itemIdx, ctx);
+                    } else {
+                        GetRateLimiters(importInfo, itemIdx, ctx);
+                    }
                 default:
                     break;
                 }
@@ -1555,6 +1637,15 @@ private:
                     itemIdx = i;
                     break;
                 }
+                if (item.Kesus) {
+                    TString error;
+                    if (!CreateKesus(*importInfo, i, txId, error)) {
+                        NIceDb::TNiceDb db(txc.DB);
+                        CancelAndPersist(db, importInfo, i, error, "creation kesus failed");
+                    }
+                    itemIdx = i;
+                    break;
+                }
                 if (IsCreatedByQuery(item)) {
                     // We only need a txId for modify scheme transactions.
                     // If an object’s CreationQuery has not been prepared yet, it does not need a txId at this point.
@@ -1810,6 +1901,111 @@ private:
         SubscribeTx(*importInfo, itemIdx);
     }
 
+    void OnRateLimitersSchemeResult(TTransactionContext& txc, const TActorContext& ctx) {
+        Y_ABORT_UNLESS(RateLimitersSchemeResult);
+
+        const auto& msg = *RateLimitersSchemeResult->Get();
+
+        LOG_D("TImport::TTxProgress: OnRateLimitersSchemeResult"
+            << ": id# " << msg.ImportId
+            << ", itemIdx# " << msg.ItemIdx
+            << ", success# " << msg.Success
+        );
+
+        if (!Self->Imports.contains(msg.ImportId)) {
+            LOG_E("TImport::TTxProgress: OnRateLimitersSchemeResult received unknown id"
+                << ": id# " << msg.ImportId);
+            return;
+        }
+
+        TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
+        if (msg.ItemIdx >= importInfo->Items.size()) {
+            LOG_E("TImport::TTxProgress: OnRateLimitersSchemeResult received unknown item"
+                << ": id# " << msg.ImportId
+                << ", item# " << msg.ItemIdx);
+            return;
+        }
+
+        NIceDb::TNiceDb db(txc.DB);
+
+        auto& item = importInfo->Items.at(msg.ItemIdx);
+        Self->RunningImportRateLimitersGetters.erase(std::exchange(item.RateLimitersGetter, {}));
+
+        if (!msg.Success) {
+            return CancelAndPersist(db, importInfo, msg.ItemIdx, msg.Error, "cannot get rate limiters scheme");
+        }
+
+        item.NextRateLimiterIdx = 0;
+        item.RateLimitersOffset += item.RateLimitersBatchSize;
+
+        if (item.RateLimiters.empty()) {
+            // No more rate limiters
+            item.State = EState::Done;
+            return TryFinish(importInfo, msg.ItemIdx, db, ctx);
+        }
+
+        Self->PersistImportItemScheme(db, *importInfo, msg.ItemIdx);
+        Self->PersistImportItemState(db, *importInfo, msg.ItemIdx);
+        Self->PersistImportState(db, *importInfo);
+
+        CreateRateLimiter(importInfo, msg.ItemIdx, ctx);
+    }
+
+    void OnCreateRateLimiterResult(TTransactionContext& txc, const TActorContext& ctx) {
+        Y_ABORT_UNLESS(CreateRateLimiterResult);
+
+        const auto& msg = *CreateRateLimiterResult->Get();
+
+        LOG_D("TImport::TTxProgress: OnCreateRateLimiterResult"
+            << ": id# " << msg.ImportId
+            << ", itemIdx# " << msg.ItemIdx
+            << ", status# " << msg.Status
+        );
+
+        if (!Self->Imports.contains(msg.ImportId)) {
+            LOG_E("TImport::TTxProgress: OnCreateRateLimiterResult received unknown id"
+                << ": id# " << msg.ImportId);
+            return;
+        }
+
+        TImportInfo::TPtr importInfo = Self->Imports.at(msg.ImportId);
+        if (importInfo->State != EState::Waiting) {
+            return;
+        }
+
+        if (msg.ItemIdx >= importInfo->Items.size()) {
+            LOG_E("TImport::TTxProgress: OnCreateRateLimiterResult received unknown item"
+                << ": id# " << msg.ImportId
+                << ", item# " << msg.ItemIdx);
+            return;
+        }
+
+        NIceDb::TNiceDb db(txc.DB);
+
+        auto& item = importInfo->Items.at(msg.ItemIdx);
+        if (msg.Status == Ydb::StatusIds::StatusCode::StatusIds_StatusCode_UNAVAILABLE) {
+            // Retry in case if kesus in unavailable
+            return CreateRateLimiter(importInfo, msg.ItemIdx, ctx);
+        }
+
+        // ALREADY_EXISTS means Kesus already persisted this resource with the same
+        // settings on a previous attempt (e.g. before a SchemeShard reboot). Treat it
+        // as success so retries are idempotent. Mismatched settings are reported by
+        // Kesus as BAD_REQUEST and still fall through to CancelAndPersist below.
+        if (msg.Status != Ydb::StatusIds::StatusCode::StatusIds_StatusCode_SUCCESS
+                && msg.Status != Ydb::StatusIds::StatusCode::StatusIds_StatusCode_ALREADY_EXISTS) {
+            return CancelAndPersist(db, importInfo, msg.ItemIdx, msg.Error, "cannot create rate limiters");
+        }
+
+        if (++item.NextRateLimiterIdx >= static_cast<int>(item.RateLimiters.size())) {
+            GetRateLimiters(importInfo, msg.ItemIdx, ctx);
+        } else {
+            CreateRateLimiter(importInfo, msg.ItemIdx, ctx);
+        }
+
+        Self->PersistImportItemState(db, *importInfo, msg.ItemIdx);
+    }
+
     void OnNotifyResult(TTransactionContext& txc, const TActorContext& ctx) {
         Y_ABORT_UNLESS(CompletedTxId);
         LOG_D("TImport::TTxProgress: OnNotifyResult"
@@ -1849,14 +2045,14 @@ private:
 
         switch (item.State) {
         case EState::CreateSchemeObject:
-            if (IsCreatedByQuery(item)) {
+            if (IsCreatedByQuery(item) || item.Topic) {
                 item.State = EState::Done;
                 break;
-            } else if (item.Topic) {
-                item.State = EState::Done;
+            } else if (item.Kesus) {
+                item.State = EState::CreateRateLimiterResources;
+                GetRateLimiters(importInfo, itemIdx, ctx);
                 break;
-            }
-            if (item.Table) {
+            } else if (item.Table) {
                 for (auto childIdx : item.ChildItems) {
                     Y_ABORT_UNLESS(childIdx < importInfo->Items.size());
                     auto& childItem = importInfo->Items.at(childIdx);
@@ -1928,6 +2124,10 @@ private:
             return SendNotificationsIfFinished(importInfo);
         }
 
+        TryFinish(importInfo, itemIdx, db, ctx);
+    }
+
+    void TryFinish(TImportInfo::TPtr importInfo, ui32 itemIdx, NIceDb::TNiceDb& db, const TActorContext& ctx) {
         const auto stateCounts = CountItemsByState(importInfo->Items);
         if (AllDone(stateCounts)) {
             importInfo->State = EState::Done;
@@ -1979,6 +2179,15 @@ ITransaction* TSchemeShard::CreateTxProgressImport(TEvSchemeShard::TEvModifySche
 ITransaction* TSchemeShard::CreateTxProgressImport(TEvIndexBuilder::TEvCreateResponse::TPtr& ev) {
     return new TImport::TTxProgress(this, ev);
 }
+
+ITransaction* TSchemeShard::CreateTxProgressImport(TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr& ev) {
+    return new TImport::TTxProgress(this, ev);
+}
+
+ITransaction* TSchemeShard::CreateTxProgressImport(TEvPrivate::TEvImportCreateRateLimiterResult::TPtr& ev) {
+    return new TImport::TTxProgress(this, ev);
+}
+
 
 ITransaction* TSchemeShard::CreateTxProgressImport(TTxId completedTxId) {
     return new TImport::TTxProgress(this, completedTxId);

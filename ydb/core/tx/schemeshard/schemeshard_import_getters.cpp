@@ -41,6 +41,21 @@ using namespace Aws;
 
 static constexpr TDuration MaxDelay = TDuration::Minutes(10);
 
+static TString GetItemSource(const TImportInfo& importInfo, ui32 itemIdx) {
+    TString srcPrefix = importInfo.GetItemSrcPrefix(itemIdx);
+
+    // Absolute path in the prefix is possible if the backup with SchemaMapping
+    if (importInfo.Kind == TImportInfo::EKind::FS) {
+        if (!srcPrefix.empty() && srcPrefix[0] != '/') {
+            srcPrefix = CanonizePath(TStringBuilder() << importInfo.GetFsSettings().base_path() << "/" << srcPrefix);
+        } else if (srcPrefix.empty()) {
+            srcPrefix = importInfo.GetFsSettings().base_path();
+        }
+    }
+
+    return srcPrefix;
+}
+
 struct TGetterSettings {
     NWrappers::IExternalStorageConfig::TPtr ExternalStorageConfig;
     ui32 Retries;
@@ -294,21 +309,6 @@ protected:
 
 // Downloads scheme-related objects from S3
 class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
-    static TString GetItemSource(const TImportInfo& importInfo, ui32 itemIdx) {
-        TString srcPrefix = importInfo.GetItemSrcPrefix(itemIdx);
-
-        // Absolute path in the prefix is possible if the backup with SchemaMapping
-        if (importInfo.Kind == TImportInfo::EKind::FS) {
-            if (!srcPrefix.empty() && srcPrefix[0] != '/') {
-                srcPrefix = CanonizePath(TStringBuilder() << importInfo.GetFsSettings().base_path() << "/" << srcPrefix);
-            } else if (srcPrefix.empty()) {
-                srcPrefix = importInfo.GetFsSettings().base_path();
-            }
-        }
-
-        return srcPrefix;
-    }
-
     static TString MetadataKeyFromSettings(const TImportInfo& importInfo, ui32 itemIdx) {
         Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
         return TStringBuilder() << GetItemSource(importInfo, itemIdx) << "/metadata.json";
@@ -371,6 +371,10 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
         return schemeKey.EndsWith(NYdb::NDump::NFiles::SystemView().FileName);
     }
 
+    static bool IsKesus(TStringBuf schemeKey) {
+        return schemeKey.EndsWith(NYdb::NDump::NFiles::CreateCoordinationNode().FileName);
+    }
+
     static bool IsCreatedByQuery(TStringBuf schemeKey) {
         return IsView(schemeKey)
             || IsReplication(schemeKey)
@@ -415,6 +419,7 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
                 return AppData()->FeatureFlags.GetEnableSysViewPermissionsExport();
             case NKikimrSchemeOp::EPathTypePersQueueGroup:
             case NKikimrSchemeOp::EPathTypeTable:
+            case NKikimrSchemeOp::EPathTypeKesus:
                 return true;
             default:
                 return false;
@@ -627,6 +632,12 @@ class TSchemeGetter: public TGetterFromS3<TSchemeGetter> {
                 return Reply(Ydb::StatusIds::BAD_REQUEST, "Cannot parse scheme");
             }
             item.Table = request;
+        } else if (IsKesus(SchemeKey)) {
+            Ydb::Coordination::CreateNodeRequest request;
+            if (!google::protobuf::TextFormat::ParseFromString(content, &request)) {
+                return Reply(Ydb::StatusIds::BAD_REQUEST, "Cannot parse scheme");
+            }
+            item.Kesus = request;
         } else {
             return Reply(Ydb::StatusIds::BAD_REQUEST, "Unsupported scheme object type");
         }
@@ -1111,6 +1122,204 @@ private:
     bool NeedValidateChecksums = true;
 
 }; // TSchemeGetter
+
+// Downloads scheme-related objects from S3
+class TRateLimitersGetter: public TGetterFromS3<TRateLimitersGetter> {
+    void SortPrefixesByHierarchy() {
+        std::ranges::sort(RateLimitersPrefixes, [](const NBackup::TRateLimiterResourceMetadata& l, const NBackup::TRateLimiterResourceMetadata& r) {
+            return std::ranges::count(l.Name, '/') < std::ranges::count(r.Name, '/');
+        });
+    }
+
+    static TString RateLimiterKeyFromSettings(const TImportInfo& importInfo, ui32 itemIdx, const TString& prefix) {
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        return TStringBuilder() << GetItemSource(importInfo, itemIdx) << "/" << prefix << "/create_rate_limiter.pb";
+    }
+
+    static bool NoObjectFound(Aws::S3::S3Errors errorType) {
+        return errorType == S3Errors::RESOURCE_NOT_FOUND || errorType == S3Errors::NO_SUCH_KEY;
+    }
+
+    void HandleRateLimiters(TEvExternalStorage::TEvListObjectsResponse::TPtr& ev) {
+        const auto& result = ev.Get()->Get()->Result;
+        LOG_D("HandleRateLimiters TEvExternalStorage::TEvListObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (!CheckResult(result, "ListObjects")) {
+            return;
+        }
+
+        const auto& objects = result.GetResult().GetContents();
+        RateLimitersPrefixes.clear();
+        RateLimitersPrefixes.reserve(objects.size());
+
+        TFsPath root = GetItemSource(*ImportInfo, ItemIdx);
+        for (const auto& obj : objects) {
+            const TFsPath path = obj.GetKey();
+            if (path.GetName() == "create_rate_limiter.pb") {
+                auto prefix = path.Parent().RelativePath(root);
+                RateLimitersPrefixes.push_back({prefix, prefix});
+            }
+        }
+
+        DownloadRateLimitersData();
+    }
+
+    void HandleRateLimiter(TEvExternalStorage::TEvHeadObjectResponse::TPtr& ev) {
+        const auto& result = ev->Get()->Result;
+
+        LOG_D("HandleRateLimiter TEvExternalStorage::TEvHeadObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (!CheckResult(result, "HeadObject")) {
+            return;
+        }
+
+        Y_ABORT_UNLESS(IndexDownloadedRateLimiter < RateLimitersPrefixes.size());
+        GetObject(RateLimiterKeyFromSettings(*ImportInfo, ItemIdx, RateLimitersPrefixes[IndexDownloadedRateLimiter].ExportPrefix), result.GetResult().GetContentLength());
+    }
+
+    void HandleRateLimiter(TEvExternalStorage::TEvGetObjectResponse::TPtr& ev) {
+        const auto& msg = *ev->Get();
+        const auto& result = msg.Result;
+
+        LOG_D("HandleRateLimiter TEvExternalStorage::TEvGetObjectResponse"
+            << ": self# " << SelfId()
+            << ", result# " << result);
+
+        if (!CheckResult(result, "GetObject")) {
+            return;
+        }
+
+        TString content;
+        if (!MaybeDecrypt(msg.Body, content, NBackup::EBackupFileType::CoordinationNodeCreateRateLimiter)) {
+            return;
+        }
+
+        Y_ABORT_UNLESS(ItemIdx < ImportInfo->Items.size());
+        auto& item = ImportInfo->Items.at(ItemIdx);
+
+        Ydb::RateLimiter::CreateResourceRequest req;
+        if (!google::protobuf::TextFormat::ParseFromString(content, &req)) {
+            return Reply(Ydb::StatusIds::BAD_REQUEST, "Cannot parse rate limiter");
+        }
+
+        item.RateLimiters.push_back(req);
+
+        auto nextStep = [this]() {
+            if (++IndexDownloadedRateLimiter >= RateLimitersPrefixes.size() || ++RateLimitersDownloaded >= ImportInfo->Items[ItemIdx].RateLimitersBatchSize) {
+                Reply();
+            } else {
+                Become(&TThis::StateDownloadingRateLimiters);
+                HeadObject(RateLimiterKeyFromSettings(*ImportInfo, ItemIdx, RateLimitersPrefixes[IndexDownloadedRateLimiter].ExportPrefix));
+            }
+        };
+
+        if (NeedValidateChecksums) {
+            StartValidatingChecksum(RateLimiterKeyFromSettings(*ImportInfo, ItemIdx, RateLimitersPrefixes[IndexDownloadedRateLimiter].ExportPrefix), content, nextStep);
+        } else {
+            nextStep();
+        }
+    }
+
+    void Reply(Ydb::StatusIds::StatusCode statusCode = Ydb::StatusIds::SUCCESS, const TString& error = TString()) override {
+        const bool success = (statusCode == Ydb::StatusIds::SUCCESS);
+        LOG_I("Reply"
+            << ": self# " << SelfId()
+            << ", success# " << success
+            << ", error# " << error);
+
+        Send(ReplyTo, new TEvPrivate::TEvImportRateLimitersSchemeReady(ImportInfo->Id, ItemIdx, success, error));
+        PassAway();
+    }
+
+    void ListRateLimites() {
+        CreateClient();
+        ListObjects(GetItemSource(*ImportInfo, ItemIdx) + "/");
+    }
+
+    void DownloadRateLimiters() {
+        if (const auto& maybeRateLimiters = ImportInfo->Items[ItemIdx].Metadata.GetRateLimiterResources()) {
+            RateLimitersPrefixes.clear();
+            RateLimitersPrefixes.reserve(maybeRateLimiters->size());
+            for (const auto& rateLimiter : *maybeRateLimiters) {
+                RateLimitersPrefixes.push_back(rateLimiter);
+            }
+
+            DownloadRateLimitersData();
+        } else {
+            if (!Key) { // not encrypted
+                ListRateLimites();
+            } else {
+                // We don't rely on S3 listing in case of encryption
+                Reply(Ydb::StatusIds::BAD_REQUEST, TStringBuilder() << "No rate limiters described in table metadata");
+            }
+        }
+    }
+
+    void DownloadRateLimitersData() {
+        if (IndexDownloadedRateLimiter >= RateLimitersPrefixes.size()) {
+            return Reply();
+        }
+        SortPrefixesByHierarchy();
+        CreateClient();
+        if (!RateLimitersPrefixes.empty()) {
+            auto& item = ImportInfo->Items.at(ItemIdx);
+            item.RateLimiters.reserve(RateLimitersPrefixes.size());
+            HeadObject(RateLimiterKeyFromSettings(*ImportInfo, ItemIdx, RateLimitersPrefixes[IndexDownloadedRateLimiter].ExportPrefix));
+        } else {
+            Reply();
+        }
+    }
+
+    void StartDownloadingRateLimiters() {
+        ResetRetries();
+        DownloadRateLimiters();
+        Become(&TThis::StateDownloadingRateLimiters);
+    }
+
+public:
+    explicit TRateLimitersGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv)
+        : TGetterFromS3<TRateLimitersGetter>(TGetterSettings::FromImportInfo(importInfo, std::move(iv)))
+        , ImportInfo(std::move(importInfo))
+        , ReplyTo(replyTo)
+        , ItemIdx(itemIdx)
+        , NeedValidateChecksums(!ImportInfo->GetSkipChecksumValidation())
+    {
+        Y_ABORT_UNLESS(itemIdx < ImportInfo->Items.size());
+        const auto& item = ImportInfo->Items.at(itemIdx);
+        IndexDownloadedRateLimiter = item.RateLimitersOffset;
+    }
+
+    void Bootstrap() {
+        StartDownloadingRateLimiters();
+    }
+
+    STATEFN(StateDownloadingRateLimiters) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvExternalStorage::TEvListObjectsResponse, HandleRateLimiters);
+            hFunc(TEvExternalStorage::TEvHeadObjectResponse, HandleRateLimiter);
+            hFunc(TEvExternalStorage::TEvGetObjectResponse, HandleRateLimiter);
+
+            sFunc(TEvents::TEvWakeup, DownloadRateLimiters);
+            sFunc(TEvents::TEvPoisonPill, PassAway);
+        }
+    }
+
+private:
+    TImportInfo::TPtr ImportInfo;
+    const TActorId ReplyTo;
+    const ui32 ItemIdx;
+
+    TVector<NBackup::TRateLimiterResourceMetadata> RateLimitersPrefixes;
+    ui64 IndexDownloadedRateLimiter;
+    int RateLimitersDownloaded = 0;
+
+    bool NeedValidateChecksums = true;
+
+}; // TRateLimitersGetter
 
 class TSchemaMappingGetter : public TGetterFromS3<TSchemaMappingGetter> {
     static TString MetadataKeyFromSettings(const TImportInfo& importInfo) {
@@ -1687,34 +1896,12 @@ private:
     std::vector<TRegExMatch> ExcludeRegexps;
 };
 
-class TFSHelper {
-public:
-    static TString GetFullPath(const TString& basePath, const TString& relativePath) {
-        if (basePath.empty()) {
-            return TStringBuilder() << "/" << relativePath;
-        }
-        return TFsPath(basePath) / relativePath;
-    }
-
-    static bool ReadFile(const TString& path, TString& content, TString& error) {
-        try {
-            if (!NFs::Exists(path)) {
-                error = TStringBuilder() << "File does not exist: " << path;
-                return false;
-            }
-
-            TFileInput file(path);
-            content = file.ReadAll();
-            return true;
-        } catch (const std::exception& e) {
-            error = TStringBuilder() << "Failed to read file " << path << ": " << e.what();
-            return false;
-        }
-    }
-};
-
 IActor* CreateSchemeGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv) {
     return new TSchemeGetter(replyTo, std::move(importInfo), itemIdx, std::move(iv));
+}
+
+IActor* CreateRateLimitersGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo, ui32 itemIdx, TMaybe<NBackup::TEncryptionIV> iv) {
+    return new TRateLimitersGetter(replyTo, std::move(importInfo), itemIdx, std::move(iv));
 }
 
 IActor* CreateSchemaMappingGetter(const TActorId& replyTo, TImportInfo::TPtr importInfo) {

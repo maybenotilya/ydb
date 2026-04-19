@@ -340,6 +340,8 @@ void TSchemeShard::PersistImportItemState(NIceDb::TNiceDb& db, const TImportInfo
         NIceDb::TUpdate<Schema::ImportItems::WaitTxId>(item.WaitTxId),
         NIceDb::TUpdate<Schema::ImportItems::NextIndexIdx>(item.NextIndexIdx),
         NIceDb::TUpdate<Schema::ImportItems::NextChangefeedIdx>(item.NextChangefeedIdx),
+        NIceDb::TUpdate<Schema::ImportItems::NextRateLimiterIdx>(item.NextRateLimiterIdx),
+        NIceDb::TUpdate<Schema::ImportItems::RateLimitersOffset>(item.RateLimitersOffset),
         NIceDb::TUpdate<Schema::ImportItems::Issue>(item.Issue)
     );
 }
@@ -368,6 +370,12 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
         );
     }
 
+    if (item.Kesus) {
+        record.Update(
+            NIceDb::TUpdate<Schema::ImportItems::Kesus>(item.Kesus->SerializeAsString())
+        );
+    }
+
     if (!item.CreationQuery.empty()) {
         record.Update(
             NIceDb::TUpdate<Schema::ImportItems::CreationQuery>(item.CreationQuery)
@@ -386,6 +394,15 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
 
     db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
         NIceDb::TUpdate<Schema::ImportItems::Changefeeds>(item.Changefeeds)
+    );
+
+    NKikimrSchemeOp::TImportTableRateLimiters rateLimiters;
+    rateLimiters.MutableRateLimiters()->Reserve(item.RateLimiters.size());
+    for (const auto& req : item.RateLimiters) {
+        *rateLimiters.AddRateLimiters() = req;
+    }
+    db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
+        NIceDb::TUpdate<Schema::ImportItems::RateLimiters>(rateLimiters)
     );
 }
 
@@ -435,6 +452,14 @@ void TSchemeShard::Handle(TEvImport::TEvListObjectsInS3ExportRequest::TPtr& ev, 
 }
 
 void TSchemeShard::Handle(TEvPrivate::TEvImportSchemeReady::TPtr& ev, const TActorContext& ctx) {
+    Execute(CreateTxProgressImport(ev), ctx);
+}
+
+void TSchemeShard::Handle(TEvPrivate::TEvImportRateLimitersSchemeReady::TPtr& ev, const TActorContext& ctx) {
+    Execute(CreateTxProgressImport(ev), ctx);
+}
+
+void TSchemeShard::Handle(TEvPrivate::TEvImportCreateRateLimiterResult::TPtr& ev, const TActorContext& ctx) {
     Execute(CreateTxProgressImport(ev), ctx);
 }
 

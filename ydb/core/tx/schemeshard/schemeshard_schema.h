@@ -3,6 +3,7 @@
 #include "schemeshard_types.h"
 
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
+#include <ydb/public/api/protos/ydb_rate_limiter.pb.h>
 
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/protos/sys_view_types.pb.h>
@@ -1705,13 +1706,17 @@ struct Schema : NIceDb::Schema {
         struct Permissions : Column<11, NScheme::NTypeIds::String> {};
         struct Metadata : Column<12, NScheme::NTypeIds::String> {};
         struct Changefeeds : Column<15, NScheme::NTypeIds::String> { using Type = NKikimrSchemeOp::TImportTableChangefeeds; };
+        struct RateLimiters : Column<23, NScheme::NTypeIds::String> { using Type = NKikimrSchemeOp::TImportTableRateLimiters; };
         struct Topic : Column<20, NScheme::NTypeIds::String> {};
         struct SysView : Column<22, NScheme::NTypeIds::String> {};
+        struct Kesus : Column<26, NScheme::NTypeIds::String> {};
 
         struct State : Column<7, NScheme::NTypeIds::Byte> {};
         struct WaitTxId : Column<8, NScheme::NTypeIds::Uint64> { using Type = TTxId; };
         struct NextIndexIdx : Column<9, NScheme::NTypeIds::Uint32> {};
         struct NextChangefeedIdx : Column<16, NScheme::NTypeIds::Uint32> {};
+        struct NextRateLimiterIdx : Column<24, NScheme::NTypeIds::Uint32> {};
+        struct RateLimitersOffset : Column<25, NScheme::NTypeIds::Uint32> {};
         struct Issue : Column<10, NScheme::NTypeIds::Utf8> {};
         struct SrcPrefix : Column<17, NScheme::NTypeIds::Utf8> {};
         struct EncryptionIV : Column<18, NScheme::NTypeIds::String> {};
@@ -1741,7 +1746,11 @@ struct Schema : NIceDb::Schema {
             SrcPath,
             Topic,
             ParentIndex,
-            SysView
+            SysView,
+            Kesus,
+            RateLimiters,
+            NextRateLimiterIdx,
+            RateLimitersOffset
         >;
     };
 
